@@ -4,7 +4,7 @@ Desktop control surface for [mvmt](https://github.com/philipnee/mvmt) — a loca
 
 The CLI does everything; this app just makes it easier to see what's running, what's mounted, who has access, and how to expose it to the outside world.
 
-![mvmt-desktop dashboard](docs/dashboard.png)
+![mvmt-desktop dashboard](docs/dashboard.jpg)
 
 ## What it does
 
