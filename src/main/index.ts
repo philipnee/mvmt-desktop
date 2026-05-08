@@ -1,13 +1,26 @@
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { request } from 'node:http';
-import { join } from 'node:path';
+import {
+  basename,
+  dirname,
+  join,
+  relative as pathRelative,
+  resolve as resolvePath,
+  sep,
+} from 'node:path';
 import {
   type AddMountInput,
+  type BrowseShareInput,
+  type BrowseShareResult,
   type CommandResult,
+  type CreatedShare,
+  type CreateShareInput,
   type CreateTokenInput,
   type EditTokenInput,
+  type MountFileEntry,
+  type ShareSummary,
   type MountSummary,
   type ServerStatus,
   type TokenSummary,
@@ -22,6 +35,49 @@ const METADATA_URL = `${SERVER_URL}/.well-known/oauth-authorization-server`;
 const COMMAND_TIMEOUT_MS = 30_000;
 
 const LOG_BUFFER_MAX = 800;
+
+let shareUrlCache: Record<string, string> = {};
+
+function shareCachePath(): string {
+  return join(app.getPath('userData'), 'share-urls.json');
+}
+
+function loadShareUrlCache(): void {
+  try {
+    const raw = readFileSync(shareCachePath(), 'utf8');
+    const parsed = JSON.parse(raw) as Record<string, string>;
+    if (parsed && typeof parsed === 'object') {
+      shareUrlCache = Object.fromEntries(
+        Object.entries(parsed).filter(([, value]) => typeof value === 'string'),
+      );
+    }
+  } catch {
+    /* no cache yet */
+  }
+}
+
+function persistShareUrlCache(): void {
+  const file = shareCachePath();
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify(shareUrlCache, null, 2), { mode: 0o600 });
+  } catch (error) {
+    appendServerLog(`Could not persist share URL cache: ${(error as Error).message}\n`);
+  }
+}
+
+function rememberShareUrl(id: string, url: string): void {
+  if (!id || !url) return;
+  shareUrlCache[id] = url;
+  persistShareUrlCache();
+}
+
+function forgetShareUrl(id: string): void {
+  if (id in shareUrlCache) {
+    delete shareUrlCache[id];
+    persistShareUrlCache();
+  }
+}
 
 let mainWindow: BrowserWindow | null = null;
 let serverProcess: ChildProcessWithoutNullStreams | null = null;
@@ -51,8 +107,10 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  loadShareUrlCache();
   registerIpcHandlers();
   createWindow();
+  void autoStartOnLaunch();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -82,6 +140,11 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle('mvmt:tokens:rotate', (_event, id: string) => rotateToken(id));
   ipcMain.handle('mvmt:tokens:remove', (_event, id: string) => removeToken(id));
+  ipcMain.handle('mvmt:shares:list', () => listShares());
+  ipcMain.handle('mvmt:shares:add', (_event, input: CreateShareInput) => addShare(input));
+  ipcMain.handle('mvmt:shares:remove', (_event, id: string) => removeShare(id));
+  ipcMain.handle('mvmt:shares:browse', (_event, input: BrowseShareInput) => browseAndShare(input));
+  ipcMain.handle('mvmt:mounts:files', (_event, name: string) => listMountFiles(name));
   ipcMain.handle('mvmt:reindex', () => runMvmt(['reindex']));
   ipcMain.handle('mvmt:open-local-server', () => shell.openExternal(METADATA_URL));
   ipcMain.handle('mvmt:tunnel:status', () => runTunnelCommand([]));
@@ -293,6 +356,268 @@ function removeToken(id: string): Promise<CommandResult> {
   return runMvmt(['token', 'remove', requireValue(id, 'Token id'), '--yes']);
 }
 
+async function listShares(): Promise<ShareSummary[]> {
+  try {
+    const result = await runMvmt(['share', '--json']);
+    const parsed = parseJson<{ shares: RawShare[] }>(result.stdout, 'share list');
+    const shares = parsed.shares.map(toShareSummary);
+    // Garbage-collect cached URLs whose share is gone.
+    const liveIds = new Set(shares.map((s) => s.id));
+    let pruned = false;
+    for (const id of Object.keys(shareUrlCache)) {
+      if (!liveIds.has(id)) {
+        delete shareUrlCache[id];
+        pruned = true;
+      }
+    }
+    if (pruned) persistShareUrlCache();
+    return shares;
+  } catch (error) {
+    if (isMissingConfigError(error)) return [];
+    throw error;
+  }
+}
+
+async function addShare(input: CreateShareInput): Promise<CreatedShare> {
+  const path = requireValue(input.path, 'Share path');
+  // Note: `mvmt share add --json` is a no-op upstream (commander routes --json
+  // to the parent `share` command, never to the subcommand), so we parse the
+  // human-readable output. Re-add --json once the engine ships the fix.
+  const args = ['share', 'add', path];
+  if (input.expires?.trim()) args.push('--expires', input.expires.trim());
+  const result = await runMvmt(args);
+  const created = parseShareAddOutput(result.stdout, path);
+  rememberShareUrl(created.share.id, created.url);
+  return created;
+}
+
+function parseShareAddOutput(stdout: string, fallbackPath: string): CreatedShare {
+  const field = (key: string): string | null => {
+    const match = stdout.match(new RegExp(`^\\s*${key}:\\s*(.+?)\\s*$`, 'm'));
+    return match ? match[1].trim() : null;
+  };
+  const url = field('URL');
+  if (!url) {
+    throw new Error(`Could not parse share URL from mvmt output:\n${stdout.trim()}`);
+  }
+  const expiresLine = field('Expires');
+  // Expires line may look like "2026-05-09T03:29:14.716Z" or "2026-... (24h default)"
+  const expiresAt = expiresLine
+    ? expiresLine.replace(/\s*\(.*\)\s*$/, '').trim()
+    : null;
+  const path = field('Path') ?? fallbackPath;
+  let id = '';
+  try {
+    const parsed = new URL(url);
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    if (segments[0] === 'share' && segments[1]) id = segments[1];
+  } catch {
+    /* ignore */
+  }
+  return {
+    share: {
+      id,
+      path,
+      createdAt: new Date().toISOString(),
+      expiresAt: expiresAt && expiresAt !== 'never' ? expiresAt : null,
+      downloadCount: 0,
+      revokedAt: null,
+    },
+    url,
+  };
+}
+
+async function removeShare(id: string): Promise<CommandResult> {
+  const shareId = requireValue(id, 'Share id');
+  const result = await runMvmt(['share', 'remove', shareId]);
+  forgetShareUrl(shareId);
+  return result;
+}
+
+async function listMountFiles(mountName: string): Promise<MountFileEntry[]> {
+  const name = requireValue(mountName, 'Mount name');
+  const mounts = await listMounts();
+  const mount = mounts.find((m) => m.name === name);
+  if (!mount) throw new Error(`Unknown mount: ${name}`);
+  return enumerateFiles(mount.root, mount.path);
+}
+
+function enumerateFiles(root: string, mountPath: string): MountFileEntry[] {
+  const results: MountFileEntry[] = [];
+  const stack: { dir: string; rel: string }[] = [{ dir: root, rel: '' }];
+  let count = 0;
+  while (stack.length > 0 && count < 500) {
+    const current = stack.pop()!;
+    let entries;
+    try {
+      entries = readdirSync(current.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      const childRel = current.rel ? `${current.rel}/${entry.name}` : entry.name;
+      const absolute = join(current.dir, entry.name);
+      let size = 0;
+      let isDirectory = entry.isDirectory();
+      try {
+        if (entry.isFile()) {
+          const stat = statSync(absolute);
+          size = stat.size;
+        }
+      } catch {
+        continue;
+      }
+      results.push({
+        name: entry.name,
+        virtualPath: joinVirtualPath(mountPath, childRel),
+        isDirectory,
+        size,
+      });
+      count += 1;
+      if (count >= 500) break;
+      if (isDirectory && current.rel.split('/').filter(Boolean).length < 3) {
+        stack.push({ dir: absolute, rel: childRel });
+      }
+    }
+  }
+  return results.sort((a, b) => {
+    if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+    return a.virtualPath.localeCompare(b.virtualPath);
+  });
+}
+
+function joinVirtualPath(mountPath: string, rel: string): string {
+  const left = mountPath.endsWith('/') ? mountPath.slice(0, -1) : mountPath;
+  return `${left}/${rel}`;
+}
+
+async function browseAndShare(input: BrowseShareInput): Promise<BrowseShareResult | null> {
+  const result = await dialog.showOpenDialog(mainWindow ?? undefined, {
+    properties: ['openFile'],
+    title: 'Pick a file to share',
+  });
+  if (result.canceled || !result.filePaths[0]) return null;
+  const filePath = result.filePaths[0];
+
+  let stat;
+  try {
+    stat = statSync(filePath);
+  } catch (error) {
+    throw new Error(`Cannot read ${filePath}: ${(error as Error).message}`);
+  }
+  if (!stat.isFile()) {
+    throw new Error('Selected entry is not a file.');
+  }
+
+  const mounts = await listMounts();
+  const existing = findEnclosingMount(filePath, mounts);
+  let mountCreated = false;
+  let mountName: string;
+  let virtualPath: string;
+
+  if (existing) {
+    mountName = existing.mount.name;
+    virtualPath = existing.virtualPath;
+  } else {
+    const filename = basename(filePath);
+    const slug = makeMountSlug(filename);
+    mountName = slug;
+    virtualPath = `/${filename}`;
+    await runMvmt([
+      'mounts',
+      'add',
+      mountName,
+      filePath,
+      '--mount-path',
+      virtualPath,
+      '--read-only',
+      '--description',
+      `Auto-mount for shared file ${filename}`,
+    ]);
+    mountCreated = true;
+  }
+
+  const created = await addShare({ path: virtualPath, expires: input.expires });
+  return {
+    share: created.share,
+    url: created.url,
+    mountCreated,
+    mountName,
+    virtualPath,
+  };
+}
+
+function findEnclosingMount(
+  filePath: string,
+  mounts: MountSummary[],
+): { mount: MountSummary; virtualPath: string } | null {
+  const targetReal = resolvePath(filePath);
+  for (const mount of mounts) {
+    const root = resolvePath(mount.root);
+    if (root === targetReal) {
+      // Mount is the file itself
+      return { mount, virtualPath: mount.path };
+    }
+    const rel = pathRelative(root, targetReal);
+    if (!rel || rel.startsWith('..') || rel.includes(`..${sep}`)) continue;
+    const virtualSuffix = rel.split(sep).join('/');
+    return { mount, virtualPath: joinVirtualPath(mount.path, virtualSuffix) };
+  }
+  return null;
+}
+
+function makeMountSlug(filename: string): string {
+  const stem = filename.replace(/\.[^.]+$/, '').toLowerCase();
+  const safe = stem.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'file';
+  const suffix = Math.random().toString(36).slice(2, 6);
+  return `share-${safe}-${suffix}`;
+}
+
+interface RawShare {
+  id: string;
+  path: string;
+  createdAt: string;
+  expiresAt?: string | null;
+  downloadCount?: number;
+  revokedAt?: string | null;
+}
+
+function toShareSummary(raw: RawShare): ShareSummary {
+  return {
+    id: raw.id,
+    path: raw.path,
+    createdAt: raw.createdAt,
+    expiresAt: raw.expiresAt ?? null,
+    downloadCount: raw.downloadCount ?? 0,
+    revokedAt: raw.revokedAt ?? null,
+    url: shareUrlCache[raw.id] ?? null,
+  };
+}
+
+async function autoStartOnLaunch(): Promise<void> {
+  if (!existsSync(MVMT_BIN)) {
+    appendServerLog(`Auto-start skipped: engine not found at ${MVMT_BIN}\n`);
+    return;
+  }
+  try {
+    const status = await startServer();
+    if (!status.reachable) return;
+    appendServerLog('Auto-start: server reachable, starting tunnel if configured…\n');
+    const tunnel = await runTunnelCommand(['start']).catch((error) => {
+      appendServerLog(`Tunnel auto-start failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      return null;
+    });
+    if (tunnel?.publicUrl) {
+      appendServerLog(`Auto-start: tunnel up at ${tunnel.publicUrl}\n`);
+    } else if (tunnel && !tunnel.configured) {
+      appendServerLog('Auto-start: no tunnel configured (run `mvmt tunnel config` once).\n');
+    }
+  } catch (error) {
+    appendServerLog(`Auto-start failed: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
+}
+
 async function startServer(): Promise<ServerStatus> {
   if (serverProcess && serverProcess.exitCode === null) return getServerStatus();
   if (await isServerReachable()) return getServerStatus();
@@ -387,9 +712,38 @@ function isServerReachable(): Promise<boolean> {
         timeout: 1_500,
       },
       (res) => {
-        const status = res.statusCode ?? 0;
-        res.resume();
-        resolve(status > 0 && status < 500);
+        if (res.statusCode !== 200) {
+          res.resume();
+          resolve(false);
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let total = 0;
+        res.on('data', (chunk: Buffer) => {
+          chunks.push(chunk);
+          total += chunk.length;
+          if (total > 64_000) {
+            res.destroy();
+            resolve(false);
+          }
+        });
+        res.on('error', () => resolve(false));
+        res.on('end', () => {
+          try {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+              issuer?: unknown;
+              authorization_endpoint?: unknown;
+              token_endpoint?: unknown;
+            };
+            const ok =
+              typeof body.issuer === 'string' &&
+              typeof body.authorization_endpoint === 'string' &&
+              typeof body.token_endpoint === 'string';
+            resolve(ok);
+          } catch {
+            resolve(false);
+          }
+        });
       },
     );
     req.on('error', () => resolve(false));

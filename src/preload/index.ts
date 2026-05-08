@@ -1,6 +1,8 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import type {
   AddMountInput,
+  BrowseShareInput,
+  CreateShareInput,
   CreateTokenInput,
   EditTokenInput,
   MvmtDesktopApi,
@@ -20,6 +22,11 @@ const api: MvmtDesktopApi = {
     ipcRenderer.invoke('mvmt:tokens:edit', id, input),
   rotateToken: (id: string) => ipcRenderer.invoke('mvmt:tokens:rotate', id),
   removeToken: (id: string) => ipcRenderer.invoke('mvmt:tokens:remove', id),
+  listShares: () => ipcRenderer.invoke('mvmt:shares:list'),
+  createShare: (input: CreateShareInput) => ipcRenderer.invoke('mvmt:shares:add', input),
+  removeShare: (id: string) => ipcRenderer.invoke('mvmt:shares:remove', id),
+  browseAndShare: (input: BrowseShareInput) => ipcRenderer.invoke('mvmt:shares:browse', input),
+  listMountFiles: (mountName: string) => ipcRenderer.invoke('mvmt:mounts:files', mountName),
   reindex: () => ipcRenderer.invoke('mvmt:reindex'),
   openLocalServer: () => ipcRenderer.invoke('mvmt:open-local-server'),
   tunnelStatus: () => ipcRenderer.invoke('mvmt:tunnel:status'),

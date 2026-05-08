@@ -6,13 +6,16 @@ import {
   Eye,
   EyeOff,
   ExternalLink,
+  FileText,
   FolderOpen,
   Globe,
   KeyRound,
+  Link as LinkIcon,
   Loader2,
   Play,
   Plus,
   RotateCw,
+  Share2,
   Square,
   Trash2,
   X,
@@ -27,8 +30,10 @@ import {
   useState,
 } from 'react';
 import type {
+  MountFileEntry,
   MountSummary,
   ServerStatus,
+  ShareSummary,
   TokenSummary,
   TunnelStatus,
 } from '../../shared/types';
@@ -90,6 +95,15 @@ export function App(): JSX.Element {
   const [revealToken, setRevealToken] = useState(false);
   const [expandedTokens, setExpandedTokens] = useState<Set<string>>(new Set());
   const [logs, setLogs] = useState<string>('');
+  const [shares, setShares] = useState<ShareSummary[]>([]);
+  const [shareResult, setShareResult] = useState<{
+    url: string;
+    path: string;
+    expiresAt: string | null;
+    mountCreated?: boolean;
+    mountName?: string;
+  } | null>(null);
+  const [showShareForm, setShowShareForm] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [showMountForm, setShowMountForm] = useState(false);
@@ -98,14 +112,16 @@ export function App(): JSX.Element {
   const [view, setView] = useState<'dashboard' | 'activity'>('dashboard');
 
   const refresh = useCallback(async () => {
-    const [nextStatus, nextMounts, nextTokens] = await Promise.all([
+    const [nextStatus, nextMounts, nextTokens, nextShares] = await Promise.all([
       window.mvmtDesktop.getStatus(),
       window.mvmtDesktop.listMounts(),
       window.mvmtDesktop.listTokens(),
+      window.mvmtDesktop.listShares().catch(() => [] as ShareSummary[]),
     ]);
     setStatus(nextStatus);
     setMounts(nextMounts);
     setTokens(nextTokens);
+    setShares(nextShares);
     if (nextStatus.reachable) {
       void window.mvmtDesktop.tunnelStatus().then(setTunnel).catch(() => undefined);
     } else {
@@ -221,6 +237,13 @@ export function App(): JSX.Element {
   }
 
   async function removeMount(name: string): Promise<void> {
+    if (
+      !window.confirm(
+        `Remove mount "${name}"? Any tokens scoped to ${name} will lose that access.`,
+      )
+    ) {
+      return;
+    }
     await runUiTask(`remove-${name}`, async () => {
       await window.mvmtDesktop.removeMount(name);
       await refresh();
@@ -328,6 +351,59 @@ export function App(): JSX.Element {
         return next;
       });
       setNotice({ kind: 'success', text: `Token ${id} revoked.` });
+    });
+  }
+
+  async function createShareFromMount(input: {
+    path: string;
+    expires: string;
+  }): Promise<void> {
+    await runUiTask('share-create', async () => {
+      const result = await window.mvmtDesktop.createShare({
+        path: input.path,
+        expires: input.expires || undefined,
+      });
+      setShareResult({
+        url: result.url,
+        path: result.share.path,
+        expiresAt: result.share.expiresAt,
+      });
+      setShowShareForm(false);
+      await refresh();
+      setNotice({ kind: 'success', text: 'Share created. Copy the link now.' });
+    });
+  }
+
+  async function browseAndShare(input: { expires: string }): Promise<void> {
+    await runUiTask('share-browse', async () => {
+      const result = await window.mvmtDesktop.browseAndShare({
+        expires: input.expires || undefined,
+      });
+      if (!result) return;
+      setShareResult({
+        url: result.url,
+        path: result.virtualPath,
+        expiresAt: result.share.expiresAt,
+        mountCreated: result.mountCreated,
+        mountName: result.mountName,
+      });
+      setShowShareForm(false);
+      await refresh();
+      setNotice({
+        kind: 'success',
+        text: result.mountCreated
+          ? `Mounted file as "${result.mountName}" and shared.`
+          : 'Share created. Copy the link now.',
+      });
+    });
+  }
+
+  async function revokeShare(id: string, path: string): Promise<void> {
+    if (!window.confirm(`Revoke share for ${path}? Existing links will stop working.`)) return;
+    await runUiTask(`share-remove-${id}`, async () => {
+      await window.mvmtDesktop.removeShare(id);
+      await refresh();
+      setNotice({ kind: 'success', text: 'Share revoked.' });
     });
   }
 
@@ -711,6 +787,24 @@ export function App(): JSX.Element {
             </div>
           )}
         </section>
+
+        <SharesCard
+          shares={shares}
+          mounts={mounts}
+          tunnel={tunnel}
+          serverReachable={reachable}
+          showForm={showShareForm}
+          onToggleForm={() => setShowShareForm((v) => !v)}
+          shareResult={shareResult}
+          onDismissResult={() => setShareResult(null)}
+          busy={busy}
+          onCreateFromMount={createShareFromMount}
+          onBrowseAndShare={browseAndShare}
+          onRevoke={revokeShare}
+          onOpen={(url) => window.mvmtDesktop.openExternal(url)}
+          onCopy={copyToClipboard}
+          listMountFiles={(name) => window.mvmtDesktop.listMountFiles(name)}
+        />
         </>)}
 
         {view === 'activity' && (
@@ -1578,5 +1672,444 @@ function TokenEditor({
         </button>
       </div>
     </div>
+  );
+}
+
+function shareUnavailableReason(share: ShareSummary): 'expired' | 'revoked' | null {
+  if (share.revokedAt) return 'revoked';
+  if (share.expiresAt) {
+    const t = new Date(share.expiresAt).getTime();
+    if (!Number.isNaN(t) && t < Date.now()) return 'expired';
+  }
+  return null;
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function SharesCard({
+  shares,
+  mounts,
+  tunnel,
+  serverReachable,
+  showForm,
+  onToggleForm,
+  shareResult,
+  onDismissResult,
+  busy,
+  onCreateFromMount,
+  onBrowseAndShare,
+  onRevoke,
+  onOpen,
+  onCopy,
+  listMountFiles,
+}: {
+  shares: ShareSummary[];
+  mounts: MountSummary[];
+  tunnel: TunnelStatus | null;
+  serverReachable: boolean;
+  showForm: boolean;
+  onToggleForm: () => void;
+  shareResult: { url: string; path: string; expiresAt: string | null; mountCreated?: boolean; mountName?: string } | null;
+  onDismissResult: () => void;
+  busy: string | null;
+  onCreateFromMount: (input: { path: string; expires: string }) => void | Promise<void>;
+  onBrowseAndShare: (input: { expires: string }) => void | Promise<void>;
+  onRevoke: (id: string, path: string) => void | Promise<void>;
+  onOpen: (url: string) => void | Promise<void>;
+  onCopy: (text: string, label: string) => void | Promise<void>;
+  listMountFiles: (mountName: string) => Promise<MountFileEntry[]>;
+}): JSX.Element {
+  const tunnelLive = Boolean(tunnel?.running && tunnel?.publicUrl);
+
+  return (
+    <section className="card">
+      <div className="card-header">
+        <div>
+          <h2 className="card-title">Shares</h2>
+          <p className="card-sub">
+            One-file download links. Default expiry 24h.{' '}
+            {!tunnelLive && (
+              <span className="muted">
+                Tunnel offline — links work locally only.
+              </span>
+            )}
+          </p>
+        </div>
+        <div className="card-actions">
+          <PrimaryButton
+            variant={showForm ? 'ghost' : 'solid'}
+            icon={showForm ? <X size={13} /> : <Share2 size={13} />}
+            label={showForm ? 'Cancel' : 'Share file'}
+            onClick={onToggleForm}
+          />
+        </div>
+      </div>
+
+      {showForm && (
+        <ShareForm
+          mounts={mounts}
+          busy={busy}
+          onSubmitFromMount={onCreateFromMount}
+          onSubmitBrowse={onBrowseAndShare}
+          listMountFiles={listMountFiles}
+        />
+      )}
+
+      {shareResult && (
+        <div className="share-result">
+          <div className="share-result-head">
+            <div>
+              <div className="share-result-title">
+                <Check size={14} aria-hidden /> Share link ready
+              </div>
+              <div className="share-result-warn">
+                Copy the link now — the token won't appear again.
+              </div>
+            </div>
+            <button type="button" className="link-button" onClick={onDismissResult}>
+              Dismiss
+            </button>
+          </div>
+          {shareResult.mountCreated && (
+            <div className="share-result-note">
+              Auto-mounted as <code className="mono">{shareResult.mountName}</code>.
+            </div>
+          )}
+          <div className="token-secret">
+            <span className="token-secret-label">Path</span>
+            <code className="token-secret-value mono">{shareResult.path}</code>
+          </div>
+          <div className="token-secret">
+            <span className="token-secret-label">URL</span>
+            <code className="token-secret-value mono">{shareResult.url}</code>
+            <button
+              type="button"
+              className="row-action"
+              title="Copy URL"
+              onClick={() => onCopy(shareResult.url, 'Share URL')}
+            >
+              <Copy size={14} />
+            </button>
+            <button
+              type="button"
+              className="row-action"
+              title="Open in browser"
+              onClick={() => onOpen(shareResult.url)}
+            >
+              <ExternalLink size={14} />
+            </button>
+          </div>
+          {shareResult.expiresAt && (
+            <div className="share-result-meta">
+              Expires {formatTimestamp(shareResult.expiresAt)}
+            </div>
+          )}
+        </div>
+      )}
+
+      {shares.length === 0 ? (
+        <EmptyState
+          icon={<LinkIcon size={20} />}
+          title="No share links"
+          hint={
+            serverReachable
+              ? 'Click "Share file" to create a one-file download link.'
+              : 'Start the local server to create share links.'
+          }
+        />
+      ) : (
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Path</th>
+                <th>Status</th>
+                <th>Expires</th>
+                <th>Downloads</th>
+                <th aria-label="Actions" />
+              </tr>
+            </thead>
+            <tbody>
+              {shares.map((share) => {
+                const reason = shareUnavailableReason(share);
+                const removing = busy === `share-remove-${share.id}`;
+                return (
+                  <tr key={share.id}>
+                    <td>
+                      <div className="cell-stack">
+                        <code className="mono">{share.path}</code>
+                      </div>
+                      <div className="muted share-id">id {share.id}</div>
+                    </td>
+                    <td>
+                      {reason ? (
+                        <span className="muted-tag">{reason}</span>
+                      ) : (
+                        <span className="access-badge read">active</span>
+                      )}
+                    </td>
+                    <td>{share.expiresAt ? formatTimestamp(share.expiresAt) : 'never'}</td>
+                    <td>{share.downloadCount}</td>
+                    <td className="row-actions share-row-actions">
+                      {share.url ? (
+                        <>
+                          <button
+                            type="button"
+                            className="row-action"
+                            title="Copy URL"
+                            onClick={() => onCopy(share.url!, 'Share URL')}
+                          >
+                            <Copy size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            className="row-action"
+                            title="Open in browser"
+                            onClick={() => onOpen(share.url!)}
+                          >
+                            <ExternalLink size={14} />
+                          </button>
+                        </>
+                      ) : (
+                        <span
+                          className="muted share-no-url"
+                          title="URL was created elsewhere — revoke and recreate to get a new link."
+                        >
+                          —
+                        </span>
+                      )}
+                      <button
+                        className="row-action danger"
+                        title={`Revoke ${share.id}`}
+                        disabled={removing}
+                        onClick={() => onRevoke(share.id, share.path)}
+                      >
+                        {removing ? (
+                          <Loader2 size={14} className="spin" />
+                        ) : (
+                          <Trash2 size={14} />
+                        )}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+const EXPIRY_PRESETS = [
+  { value: '1h', label: '1 hour' },
+  { value: '24h', label: '24 hours' },
+  { value: '7d', label: '7 days' },
+  { value: '30d', label: '30 days' },
+  { value: 'never', label: 'Never' },
+];
+
+function ShareForm({
+  mounts,
+  busy,
+  onSubmitFromMount,
+  onSubmitBrowse,
+  listMountFiles,
+}: {
+  mounts: MountSummary[];
+  busy: string | null;
+  onSubmitFromMount: (input: { path: string; expires: string }) => void | Promise<void>;
+  onSubmitBrowse: (input: { expires: string }) => void | Promise<void>;
+  listMountFiles: (mountName: string) => Promise<MountFileEntry[]>;
+}): JSX.Element {
+  const [mode, setMode] = useState<'mount' | 'browse'>('mount');
+  const [expires, setExpires] = useState('24h');
+  const enabledMounts = useMemo(() => mounts.filter((m) => m.enabled), [mounts]);
+  const [mountName, setMountName] = useState<string>(enabledMounts[0]?.name ?? '');
+  const [files, setFiles] = useState<MountFileEntry[]>([]);
+  const [selectedFile, setSelectedFile] = useState<string>('');
+  const [filesLoading, setFilesLoading] = useState(false);
+
+  useEffect(() => {
+    if (!mountName) {
+      setFiles([]);
+      setSelectedFile('');
+      return;
+    }
+    setFilesLoading(true);
+    let cancelled = false;
+    listMountFiles(mountName)
+      .then((entries) => {
+        if (cancelled) return;
+        const fileEntries = entries.filter((e) => !e.isDirectory);
+        setFiles(fileEntries);
+        setSelectedFile((current) =>
+          current && fileEntries.some((e) => e.virtualPath === current)
+            ? current
+            : fileEntries[0]?.virtualPath ?? '',
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setFiles([]);
+      })
+      .finally(() => {
+        if (!cancelled) setFilesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mountName, listMountFiles]);
+
+  const createBusy = busy === 'share-create';
+  const browseBusy = busy === 'share-browse';
+
+  const submitMount = (event: FormEvent<HTMLFormElement>): void => {
+    event.preventDefault();
+    if (!selectedFile) return;
+    void onSubmitFromMount({ path: selectedFile, expires });
+  };
+
+  return (
+    <div className="inline-form share-form">
+      <div className="share-mode-tabs">
+        <button
+          type="button"
+          className={`mode-tab ${mode === 'mount' ? 'on' : ''}`}
+          onClick={() => setMode('mount')}
+        >
+          <FolderOpen size={13} />
+          From mount
+        </button>
+        <button
+          type="button"
+          className={`mode-tab ${mode === 'browse' ? 'on' : ''}`}
+          onClick={() => setMode('browse')}
+        >
+          <FileText size={13} />
+          Browse files
+        </button>
+      </div>
+
+      {mode === 'mount' ? (
+        <form onSubmit={submitMount} className="share-form-body">
+          {enabledMounts.length === 0 ? (
+            <p className="muted" style={{ margin: 0 }}>
+              No mounts to share from. Add a mount first, or use “Browse files”.
+            </p>
+          ) : (
+            <>
+              <div className="field-grid">
+                <Field label="Mount" required>
+                  <div className="scope-select">
+                    <select
+                      value={mountName}
+                      onChange={(e) => setMountName(e.target.value)}
+                    >
+                      {enabledMounts.map((m) => (
+                        <option key={m.name} value={m.name}>
+                          {m.name} ({m.path})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </Field>
+                <Field label="File" required>
+                  <div className="scope-select">
+                    <select
+                      value={selectedFile}
+                      onChange={(e) => setSelectedFile(e.target.value)}
+                      disabled={filesLoading || files.length === 0}
+                    >
+                      {filesLoading && <option value="">Loading…</option>}
+                      {!filesLoading && files.length === 0 && (
+                        <option value="">No files in this mount</option>
+                      )}
+                      {!filesLoading &&
+                        files.map((f) => (
+                          <option key={f.virtualPath} value={f.virtualPath}>
+                            {f.virtualPath} · {formatBytes(f.size)}
+                          </option>
+                        ))}
+                    </select>
+                  </div>
+                </Field>
+              </div>
+              <ExpirySelector value={expires} onChange={setExpires} />
+              <div className="form-actions">
+                <PrimaryButton
+                  type="submit"
+                  icon={<LinkIcon size={13} />}
+                  label="Create link"
+                  busy={createBusy}
+                  disabled={!selectedFile}
+                />
+              </div>
+            </>
+          )}
+        </form>
+      ) : (
+        <div className="share-form-body">
+          <p className="muted" style={{ margin: 0 }}>
+            Pick a file from anywhere on your machine. If it's not already inside a
+            mount, mvmt will auto-mount it as read-only.
+          </p>
+          <ExpirySelector value={expires} onChange={setExpires} />
+          <div className="form-actions">
+            <PrimaryButton
+              icon={<FolderOpen size={13} />}
+              label="Choose file & share"
+              busy={browseBusy}
+              onClick={() => onSubmitBrowse({ expires })}
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ExpirySelector({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+}): JSX.Element {
+  const isPreset = EXPIRY_PRESETS.some((p) => p.value === value);
+  return (
+    <Field label="Expires">
+      <div className="expiry-row">
+        <div className="scope-select">
+          <select
+            value={isPreset ? value : 'custom'}
+            onChange={(e) => {
+              if (e.target.value === 'custom') return;
+              onChange(e.target.value);
+            }}
+          >
+            {EXPIRY_PRESETS.map((p) => (
+              <option key={p.value} value={p.value}>
+                {p.label}
+              </option>
+            ))}
+            <option value="custom">Custom…</option>
+          </select>
+        </div>
+        {!isPreset && (
+          <input
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            placeholder="e.g. 12h, 3d, 90d"
+            style={{ maxWidth: 160 }}
+          />
+        )}
+      </div>
+    </Field>
   );
 }

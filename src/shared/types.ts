@@ -68,6 +68,46 @@ export interface EditTokenInput {
   expires?: string;
 }
 
+export interface ShareSummary {
+  id: string;
+  path: string;
+  createdAt: string;
+  expiresAt: string | null;
+  downloadCount: number;
+  revokedAt: string | null;
+  /** Cached URL captured at creation (engine only stores a hash). */
+  url: string | null;
+}
+
+export interface CreateShareInput {
+  path: string;
+  expires?: string;
+}
+
+export interface CreatedShare {
+  share: ShareSummary;
+  url: string;
+}
+
+export interface BrowseShareInput {
+  expires?: string;
+}
+
+export interface BrowseShareResult {
+  share: ShareSummary;
+  url: string;
+  mountCreated: boolean;
+  mountName: string;
+  virtualPath: string;
+}
+
+export interface MountFileEntry {
+  name: string;
+  virtualPath: string;
+  isDirectory: boolean;
+  size: number;
+}
+
 export interface MvmtDesktopApi {
   getStatus(): Promise<ServerStatus>;
   startServer(): Promise<ServerStatus>;
@@ -81,6 +121,11 @@ export interface MvmtDesktopApi {
   editToken(id: string, input: EditTokenInput): Promise<CommandResult>;
   rotateToken(id: string): Promise<CommandResult>;
   removeToken(id: string): Promise<CommandResult>;
+  listShares(): Promise<ShareSummary[]>;
+  createShare(input: CreateShareInput): Promise<CreatedShare>;
+  removeShare(id: string): Promise<CommandResult>;
+  browseAndShare(input: BrowseShareInput): Promise<BrowseShareResult | null>;
+  listMountFiles(mountName: string): Promise<MountFileEntry[]>;
   reindex(): Promise<CommandResult>;
   openLocalServer(): Promise<void>;
   tunnelStatus(): Promise<TunnelStatus>;
