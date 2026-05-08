@@ -27,8 +27,56 @@ import {
   type TunnelStatus,
 } from '../shared/types';
 
-const MVMT_BIN = process.env.MVMT_BIN ?? '/Users/philipnee/code/mvmt/dist/bin/mvmt.js';
-const MVMT_NODE_BIN = process.env.MVMT_NODE_BIN ?? 'node';
+function resolveResourcesRoot(): string {
+  return app.isPackaged ? process.resourcesPath : join(app.getAppPath(), 'vendor');
+}
+
+function resolveMvmtBin(): string {
+  if (process.env.MVMT_BIN) return process.env.MVMT_BIN;
+  // Packaged: <resourcesPath>/mvmt/dist/bin/mvmt.js
+  // Dev: <repo>/vendor/mvmt/dist/bin/mvmt.js, falling back to ~/code/mvmt for local dev
+  const candidates = [
+    join(resolveResourcesRoot(), 'mvmt', 'dist', 'bin', 'mvmt.js'),
+    '/Users/philipnee/code/mvmt/dist/bin/mvmt.js',
+  ];
+  return candidates.find(existsSync) ?? candidates[0];
+}
+
+function resolveCloudflaredBinDir(): string | null {
+  if (process.env.MVMT_CLOUDFLARED_DIR) return process.env.MVMT_CLOUDFLARED_DIR;
+  const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
+  const platform =
+    process.platform === 'darwin' ? 'darwin' :
+    process.platform === 'win32'  ? 'win'    :
+    process.platform === 'linux'  ? 'linux'  : null;
+  if (!platform) return null;
+  const dir = join(resolveResourcesRoot(), 'cloudflared', `${platform}-${arch}`);
+  return existsSync(dir) ? dir : null;
+}
+
+function mvmtSpawnEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    FORCE_COLOR: '0',
+    NO_COLOR: '1',
+    ELECTRON_RUN_AS_NODE: '1',
+  };
+  // Strip any --inspect / --require args that Electron may have set, so the
+  // child Node process starts clean.
+  delete env.NODE_OPTIONS;
+  delete env.ELECTRON_NO_ATTACH_CONSOLE;
+
+  // Make our bundled cloudflared discoverable by mvmt's tunnel-controller.
+  const cfDir = resolveCloudflaredBinDir();
+  if (cfDir) {
+    const sep = process.platform === 'win32' ? ';' : ':';
+    env.PATH = `${cfDir}${sep}${env.PATH ?? ''}`;
+  }
+  return env;
+}
+
+const MVMT_BIN = resolveMvmtBin();
+const MVMT_NODE_BIN = process.env.MVMT_NODE_BIN ?? process.execPath;
 const MVMT_PORT = Number.parseInt(process.env.MVMT_PORT ?? '4141', 10);
 const SERVER_URL = `http://127.0.0.1:${MVMT_PORT}`;
 const METADATA_URL = `${SERVER_URL}/.well-known/oauth-authorization-server`;
@@ -244,7 +292,7 @@ async function runMvmt(args: string[]): Promise<CommandResult> {
 
   return new Promise((resolve, reject) => {
     const child = spawn(MVMT_NODE_BIN, [MVMT_BIN, '--no-update-check', ...args], {
-      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+      env: mvmtSpawnEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -628,7 +676,7 @@ async function startServer(): Promise<ServerStatus> {
     MVMT_NODE_BIN,
     [MVMT_BIN, '--no-update-check', 'serve', '--port', String(MVMT_PORT), '--verbose'],
     {
-      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+      env: mvmtSpawnEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],
     },
   );
