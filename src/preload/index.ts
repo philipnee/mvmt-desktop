@@ -1,7 +1,10 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import type {
   AddMountInput,
+  AddLeasePathsInput,
+  BrowseLeaseInput,
   BrowseShareInput,
+  CreateLeaseInput,
   CreateShareInput,
   CreateTokenInput,
   EditTokenInput,
@@ -22,6 +25,13 @@ const api: MvmtDesktopApi = {
     ipcRenderer.invoke('mvmt:tokens:edit', id, input),
   rotateToken: (id: string) => ipcRenderer.invoke('mvmt:tokens:rotate', id),
   removeToken: (id: string) => ipcRenderer.invoke('mvmt:tokens:remove', id),
+  listLeases: () => ipcRenderer.invoke('mvmt:leases:list'),
+  createLease: (input: CreateLeaseInput) => ipcRenderer.invoke('mvmt:leases:create', input),
+  addLeasePaths: (input: AddLeasePathsInput) => ipcRenderer.invoke('mvmt:leases:add-paths', input),
+  revokeLease: (id: string) => ipcRenderer.invoke('mvmt:leases:revoke', id),
+  browseAndCreateLease: (input: BrowseLeaseInput) =>
+    ipcRenderer.invoke('mvmt:leases:browse', input),
+  browseAndAddLeasePaths: (id: string) => ipcRenderer.invoke('mvmt:leases:browse-add-paths', id),
   listShares: () => ipcRenderer.invoke('mvmt:shares:list'),
   createShare: (input: CreateShareInput) => ipcRenderer.invoke('mvmt:shares:add', input),
   removeShare: (id: string) => ipcRenderer.invoke('mvmt:shares:remove', id),
@@ -30,6 +40,8 @@ const api: MvmtDesktopApi = {
   reindex: () => ipcRenderer.invoke('mvmt:reindex'),
   openLocalServer: () => ipcRenderer.invoke('mvmt:open-local-server'),
   tunnelStatus: () => ipcRenderer.invoke('mvmt:tunnel:status'),
+  tunnelConfigureQuick: () => ipcRenderer.invoke('mvmt:tunnel:configure-quick'),
+  tunnelConfigureCloudflareConfig: (path: string) => ipcRenderer.invoke('mvmt:tunnel:configure-cloudflare-config', path),
   tunnelStart: () => ipcRenderer.invoke('mvmt:tunnel:start'),
   tunnelStop: () => ipcRenderer.invoke('mvmt:tunnel:stop'),
   tunnelRefresh: () => ipcRenderer.invoke('mvmt:tunnel:refresh'),

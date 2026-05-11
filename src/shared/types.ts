@@ -79,6 +79,52 @@ export interface ShareSummary {
   url: string | null;
 }
 
+export interface LeaseSummary {
+  id: string;
+  label: string;
+  path: string;
+  resources: LeaseResourceSummary[];
+  permissions: string[];
+  createdAt: string;
+  expiresAt: string | null;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+  downloadCount: number;
+  uploadCount: number;
+  /** Cached URL captured at creation (engine only stores a hash). */
+  url: string | null;
+}
+
+export interface LeaseResourceSummary {
+  path: string;
+  sourcePath: string;
+  type: 'file' | 'folder';
+}
+
+export interface CreateLeaseInput {
+  paths: string[];
+  path?: string;
+  label: string;
+  mode: 'read' | 'upload';
+  expires?: string;
+}
+
+export interface CreatedLease {
+  lease: LeaseSummary;
+  url: string;
+}
+
+export interface BrowseLeaseInput {
+  label: string;
+  mode: 'read' | 'upload';
+  expires?: string;
+}
+
+export interface AddLeasePathsInput {
+  id: string;
+  paths: string[];
+}
+
 export interface CreateShareInput {
   path: string;
   expires?: string;
@@ -121,6 +167,12 @@ export interface MvmtDesktopApi {
   editToken(id: string, input: EditTokenInput): Promise<CommandResult>;
   rotateToken(id: string): Promise<CommandResult>;
   removeToken(id: string): Promise<CommandResult>;
+  listLeases(): Promise<LeaseSummary[]>;
+  createLease(input: CreateLeaseInput): Promise<CreatedLease>;
+  addLeasePaths(input: AddLeasePathsInput): Promise<CommandResult>;
+  revokeLease(id: string): Promise<CommandResult>;
+  browseAndCreateLease(input: BrowseLeaseInput): Promise<CreatedLease | null>;
+  browseAndAddLeasePaths(id: string): Promise<CommandResult | null>;
   listShares(): Promise<ShareSummary[]>;
   createShare(input: CreateShareInput): Promise<CreatedShare>;
   removeShare(id: string): Promise<CommandResult>;
@@ -129,6 +181,8 @@ export interface MvmtDesktopApi {
   reindex(): Promise<CommandResult>;
   openLocalServer(): Promise<void>;
   tunnelStatus(): Promise<TunnelStatus>;
+  tunnelConfigureQuick(): Promise<TunnelStatus>;
+  tunnelConfigureCloudflareConfig(path: string): Promise<TunnelStatus>;
   tunnelStart(): Promise<TunnelStatus>;
   tunnelStop(): Promise<TunnelStatus>;
   tunnelRefresh(): Promise<TunnelStatus>;

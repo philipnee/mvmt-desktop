@@ -449,24 +449,40 @@ p {
 }
 
 input[type='text'],
-input:not([type='checkbox']) {
+input:not([type='checkbox']),
+textarea {
   width: 100%;
-  height: 34px;
-  padding: 0 11px;
+  min-height: 34px;
+  padding: 8px 11px;
   border: 1px solid var(--border-strong);
   border-radius: 6px;
   background: var(--surface);
   color: var(--text);
   font-size: 13px;
+  font-family: inherit;
   outline: none;
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 
-input::placeholder {
+input[type='text'],
+input:not([type='checkbox']) {
+  height: 34px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+textarea {
+  min-height: 68px;
+  resize: vertical;
+}
+
+input::placeholder,
+textarea::placeholder {
   color: var(--text-subtle);
 }
 
-input:focus {
+input:focus,
+textarea:focus {
   border-color: var(--text);
   box-shadow: 0 0 0 3px var(--focus);
 }
@@ -860,6 +876,10 @@ input:focus {
   background: var(--surface);
   color: var(--text);
   font-size: 12px;
+}
+
+.endpoint-path-input {
+  max-width: 280px;
 }
 
 .log-details summary {
