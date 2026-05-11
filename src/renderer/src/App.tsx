@@ -15,7 +15,7 @@ import {
   Play,
   Plus,
   RotateCw,
-  Share2,
+  Settings,
   Square,
   Trash2,
   X,
@@ -30,6 +30,7 @@ import {
   useState,
 } from 'react';
 import type {
+  LeaseSummary,
   MountFileEntry,
   MountSummary,
   ServerStatus,
@@ -95,33 +96,34 @@ export function App(): JSX.Element {
   const [revealToken, setRevealToken] = useState(false);
   const [expandedTokens, setExpandedTokens] = useState<Set<string>>(new Set());
   const [logs, setLogs] = useState<string>('');
-  const [shares, setShares] = useState<ShareSummary[]>([]);
-  const [shareResult, setShareResult] = useState<{
+  const [leases, setLeases] = useState<LeaseSummary[]>([]);
+  const [leaseResult, setLeaseResult] = useState<{
     url: string;
     path: string;
+    label: string;
+    mode: string;
     expiresAt: string | null;
-    mountCreated?: boolean;
-    mountName?: string;
   } | null>(null);
-  const [showShareForm, setShowShareForm] = useState(false);
+  const [showLeaseForm, setShowLeaseForm] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [showMountForm, setShowMountForm] = useState(false);
   const [showTokenForm, setShowTokenForm] = useState(false);
+  const [showTunnelConfig, setShowTunnelConfig] = useState(false);
   const [tunnel, setTunnel] = useState<TunnelStatus | null>(null);
   const [view, setView] = useState<'dashboard' | 'activity'>('dashboard');
 
   const refresh = useCallback(async () => {
-    const [nextStatus, nextMounts, nextTokens, nextShares] = await Promise.all([
+    const [nextStatus, nextMounts, nextTokens, nextLeases] = await Promise.all([
       window.mvmtDesktop.getStatus(),
       window.mvmtDesktop.listMounts(),
       window.mvmtDesktop.listTokens(),
-      window.mvmtDesktop.listShares().catch(() => [] as ShareSummary[]),
+      window.mvmtDesktop.listLeases().catch(() => [] as LeaseSummary[]),
     ]);
     setStatus(nextStatus);
     setMounts(nextMounts);
     setTokens(nextTokens);
-    setShares(nextShares);
+    setLeases(nextLeases);
     if (nextStatus.reachable) {
       void window.mvmtDesktop.tunnelStatus().then(setTunnel).catch(() => undefined);
     } else {
@@ -280,18 +282,55 @@ export function App(): JSX.Element {
   }
 
   async function startTunnel(): Promise<void> {
+    if (!tunnel?.configured) {
+      setShowTunnelConfig(true);
+      setNotice({ kind: 'info', text: 'Choose a tunnel provider below.' });
+      return;
+    }
     await runUiTask('tunnel', async () => {
       const next = await window.mvmtDesktop.tunnelStart();
       setTunnel(next);
       if (next.publicUrl) {
+        setShowTunnelConfig(false);
         setNotice({ kind: 'success', text: `Tunnel up at ${next.publicUrl}` });
       } else if (!next.configured) {
+        setShowTunnelConfig(true);
         setNotice({
           kind: 'info',
-          text: 'No tunnel configured. Run `mvmt tunnel config` in a terminal.',
+          text: 'Choose a tunnel provider below.',
         });
       } else {
         setNotice({ kind: 'info', text: 'Tunnel starting…' });
+      }
+    });
+  }
+
+  async function configureQuickTunnel(): Promise<void> {
+    await runUiTask('tunnel', async () => {
+      const next = await window.mvmtDesktop.tunnelConfigureQuick();
+      setTunnel(next);
+      setShowTunnelConfig(false);
+      if (next.publicUrl) {
+        setNotice({ kind: 'success', text: `Tunnel up at ${next.publicUrl}` });
+      } else if (next.configured) {
+        setNotice({ kind: 'info', text: 'Quick Tunnel configured. Waiting for public URL…' });
+      } else {
+        setNotice({ kind: 'error', text: next.raw || 'Could not configure Quick Tunnel.' });
+      }
+    });
+  }
+
+  async function configureCloudflareTunnel(path: string): Promise<void> {
+    await runUiTask('tunnel', async () => {
+      const next = await window.mvmtDesktop.tunnelConfigureCloudflareConfig(path);
+      setTunnel(next);
+      setShowTunnelConfig(false);
+      if (next.publicUrl) {
+        setNotice({ kind: 'success', text: `Tunnel configured at ${next.publicUrl}` });
+      } else if (next.configured) {
+        setNotice({ kind: 'info', text: 'Cloudflare tunnel configured. Start it when ready.' });
+      } else {
+        setNotice({ kind: 'error', text: next.raw || 'Could not configure Cloudflare tunnel.' });
       }
     });
   }
@@ -354,56 +393,72 @@ export function App(): JSX.Element {
     });
   }
 
-  async function createShareFromMount(input: {
-    path: string;
+  async function createLease(input: {
+    paths: string[];
+    label: string;
+    mode: 'read' | 'upload';
     expires: string;
   }): Promise<void> {
-    await runUiTask('share-create', async () => {
-      const result = await window.mvmtDesktop.createShare({
-        path: input.path,
+    await runUiTask('lease-create', async () => {
+      const result = await window.mvmtDesktop.createLease({
+        paths: input.paths,
+        label: input.label,
+        mode: input.mode,
         expires: input.expires || undefined,
       });
-      setShareResult({
+      setLeaseResult({
         url: result.url,
-        path: result.share.path,
-        expiresAt: result.share.expiresAt,
+        path: formatLeasePaths(result.lease),
+        label: result.lease.label,
+        mode: result.lease.permissions.includes('upload') ? 'upload only' : 'browse/download',
+        expiresAt: result.lease.expiresAt,
       });
-      setShowShareForm(false);
+      setShowLeaseForm(false);
       await refresh();
-      setNotice({ kind: 'success', text: 'Share created. Copy the link now.' });
+      setNotice({ kind: 'success', text: 'Lease created. Copy the link now.' });
     });
   }
 
-  async function browseAndShare(input: { expires: string }): Promise<void> {
-    await runUiTask('share-browse', async () => {
-      const result = await window.mvmtDesktop.browseAndShare({
+  async function browseAndCreateLease(input: {
+    label: string;
+    mode: 'read' | 'upload';
+    expires: string;
+  }): Promise<void> {
+    await runUiTask('lease-browse', async () => {
+      const result = await window.mvmtDesktop.browseAndCreateLease({
+        label: input.label,
+        mode: input.mode,
         expires: input.expires || undefined,
       });
       if (!result) return;
-      setShareResult({
+      setLeaseResult({
         url: result.url,
-        path: result.virtualPath,
-        expiresAt: result.share.expiresAt,
-        mountCreated: result.mountCreated,
-        mountName: result.mountName,
+        path: formatLeasePaths(result.lease),
+        label: result.lease.label,
+        mode: result.lease.permissions.includes('upload') ? 'upload only' : 'browse/download',
+        expiresAt: result.lease.expiresAt,
       });
-      setShowShareForm(false);
+      setShowLeaseForm(false);
       await refresh();
-      setNotice({
-        kind: 'success',
-        text: result.mountCreated
-          ? `Mounted file as "${result.mountName}" and shared.`
-          : 'Share created. Copy the link now.',
-      });
+      setNotice({ kind: 'success', text: 'Lease created. Copy the link now.' });
     });
   }
 
-  async function revokeShare(id: string, path: string): Promise<void> {
-    if (!window.confirm(`Revoke share for ${path}? Existing links will stop working.`)) return;
-    await runUiTask(`share-remove-${id}`, async () => {
-      await window.mvmtDesktop.removeShare(id);
+  async function revokeLease(id: string, label: string): Promise<void> {
+    if (!window.confirm(`Revoke lease "${label}"? Existing links will stop working.`)) return;
+    await runUiTask(`lease-revoke-${id}`, async () => {
+      await window.mvmtDesktop.revokeLease(id);
       await refresh();
-      setNotice({ kind: 'success', text: 'Share revoked.' });
+      setNotice({ kind: 'success', text: 'Lease revoked.' });
+    });
+  }
+
+  async function addPathsToLease(id: string, label: string): Promise<void> {
+    await runUiTask(`lease-add-paths-${id}`, async () => {
+      const result = await window.mvmtDesktop.browseAndAddLeasePaths(id);
+      if (!result) return;
+      await refresh();
+      setNotice({ kind: 'success', text: `Added paths to "${label}". Existing link now includes them.` });
     });
   }
 
@@ -475,335 +530,35 @@ export function App(): JSX.Element {
           reachable={reachable}
           port={port}
           busy={busy}
+          showTunnelConfig={showTunnelConfig}
           onStartServer={startServer}
           onStopServer={stopServer}
           onStartTunnel={startTunnel}
+          onConfigureQuickTunnel={configureQuickTunnel}
+          onConfigureCloudflareTunnel={configureCloudflareTunnel}
+          onShowTunnelConfig={() => setShowTunnelConfig(true)}
+          onDismissTunnelConfig={() => setShowTunnelConfig(false)}
           onStopTunnel={stopTunnel}
           onRefreshTunnel={refreshTunnel}
           onOpen={(url) => window.mvmtDesktop.openExternal(url)}
           onCopy={copyToClipboard}
         />
 
-        <section className="card">
-          <div className="card-header">
-            <div>
-              <h2 className="card-title">Mounts</h2>
-              <p className="card-sub">Folders exposed to the engine. Write access is the base permission.</p>
-            </div>
-            <div className="card-actions">
-              <GhostButton
-                icon={<RotateCw size={14} />}
-                label="Reindex"
-                busy={busy === 'reindex'}
-                disabled={!reachable}
-                onClick={reindex}
-              />
-              <PrimaryButton
-                variant={showMountForm ? 'ghost' : 'solid'}
-                icon={showMountForm ? <X size={13} /> : <Plus size={13} />}
-                label={showMountForm ? 'Cancel' : 'Add mount'}
-                onClick={() => setShowMountForm((v) => !v)}
-              />
-            </div>
-          </div>
-
-          {showMountForm && (
-            <form onSubmit={submitMount} className="inline-form">
-              <div className="field-grid">
-                <Field label="Name" required>
-                  <input
-                    value={mountForm.name}
-                    onChange={(e) => setMountForm({ ...mountForm, name: e.target.value })}
-                    placeholder="books"
-                    required
-                  />
-                </Field>
-                <Field label="Mount path" required>
-                  <input
-                    value={mountForm.mountPath}
-                    onChange={(e) => setMountForm({ ...mountForm, mountPath: e.target.value })}
-                    placeholder="/books"
-                    required
-                  />
-                </Field>
-                <Field label="Folder" full required>
-                  <div className="input-with-action">
-                    <input
-                      value={mountForm.root}
-                      onChange={(e) => setMountForm({ ...mountForm, root: e.target.value })}
-                      placeholder="/Users/you/books"
-                      required
-                    />
-                    <button type="button" className="input-action" onClick={chooseFolder}>
-                      <FolderOpen size={14} /> Browse
-                    </button>
-                  </div>
-                </Field>
-                <Field label="Description" full>
-                  <input
-                    value={mountForm.description}
-                    onChange={(e) => setMountForm({ ...mountForm, description: e.target.value })}
-                    placeholder="Short label shown to clients"
-                  />
-                </Field>
-              </div>
-
-              <label className="toggle-row">
-                <input
-                  type="checkbox"
-                  checked={mountForm.writeAccess}
-                  onChange={(e) => setMountForm({ ...mountForm, writeAccess: e.target.checked })}
-                />
-                <span>Allow write access</span>
-              </label>
-
-              <div className="form-actions">
-                <PrimaryButton
-                  type="submit"
-                  icon={<Check size={13} />}
-                  label="Save mount"
-                  busy={busy === 'mount'}
-                />
-              </div>
-            </form>
-          )}
-
-          {mounts.length === 0 ? (
-            <EmptyState
-              icon={<FolderOpen size={20} />}
-              title="No mounts yet"
-              hint="Add a folder to expose it to the engine."
-            />
-          ) : (
-            <div className="table-wrap">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Name</th>
-                    <th>Mount path</th>
-                    <th>Folder</th>
-                    <th>Access</th>
-                    <th aria-label="Actions" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {mounts.map((mount) => (
-                    <tr key={mount.name}>
-                      <td>
-                        <div className="cell-stack">
-                          <span className="cell-strong">{mount.name}</span>
-                          {!mount.enabled && <span className="muted-tag">disabled</span>}
-                        </div>
-                      </td>
-                      <td><code className="mono">{mount.path}</code></td>
-                      <td><span className="path-cell">{mount.root}</span></td>
-                      <td><AccessBadge writeAccess={mount.writeAccess} /></td>
-                      <td className="row-actions">
-                        <button
-                          className="row-action danger"
-                          title={`Remove ${mount.name}`}
-                          disabled={busy === `remove-${mount.name}`}
-                          onClick={() => removeMount(mount.name)}
-                        >
-                          {busy === `remove-${mount.name}` ? (
-                            <Loader2 size={14} className="spin" />
-                          ) : (
-                            <Trash2 size={14} />
-                          )}
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-
-        <section className="card">
-          <div className="card-header">
-            <div>
-              <h2 className="card-title">Tokens</h2>
-              <p className="card-sub">Scoped credentials. Token scope cannot exceed mount permissions.</p>
-            </div>
-            <div className="card-actions">
-              <PrimaryButton
-                variant={showTokenForm ? 'ghost' : 'solid'}
-                icon={showTokenForm ? <X size={13} /> : <Plus size={13} />}
-                label={showTokenForm ? 'Cancel' : 'Create token'}
-                onClick={() => setShowTokenForm((v) => !v)}
-              />
-            </div>
-          </div>
-
-          {showTokenForm && (
-            <form onSubmit={submitToken} className="inline-form">
-              <div className="field-grid">
-                <Field label="Token id" required>
-                  <input
-                    value={tokenForm.id}
-                    onChange={(e) => setTokenForm({ ...tokenForm, id: e.target.value })}
-                    placeholder="desktop"
-                    required
-                  />
-                </Field>
-                <Field label="Display name">
-                  <input
-                    value={tokenForm.displayName}
-                    onChange={(e) => setTokenForm({ ...tokenForm, displayName: e.target.value })}
-                    placeholder="Desktop"
-                  />
-                </Field>
-                <Field label="Permissions" full required>
-                  <ScopePicker
-                    mounts={mounts}
-                    value={parseScopeList(tokenForm.scopes)}
-                    onChange={(scopes) =>
-                      setTokenForm({ ...tokenForm, scopes: scopes.join(',') })
-                    }
-                  />
-                </Field>
-                <Field label="Client">
-                  <input
-                    value={tokenForm.client}
-                    onChange={(e) => setTokenForm({ ...tokenForm, client: e.target.value })}
-                    placeholder="any"
-                  />
-                </Field>
-                <Field label="Expires">
-                  <input
-                    value={tokenForm.expires}
-                    onChange={(e) => setTokenForm({ ...tokenForm, expires: e.target.value })}
-                    placeholder="never"
-                  />
-                </Field>
-              </div>
-              <div className="form-actions">
-                <PrimaryButton
-                  type="submit"
-                  icon={<KeyRound size={13} />}
-                  label="Create token"
-                  busy={busy === 'token'}
-                />
-              </div>
-            </form>
-          )}
-
-          {tokenResult && (
-            <TokenResultCard
-              result={tokenResult}
-              revealed={revealToken}
-              onReveal={() => setRevealToken((v) => !v)}
-              onDismiss={() => setTokenResult(null)}
-              onCopy={copyToClipboard}
-            />
-          )}
-
-          {tokens.length === 0 ? (
-            <EmptyState
-              icon={<KeyRound size={20} />}
-              title="No tokens yet"
-              hint="Create one to grant scoped access to the engine."
-            />
-          ) : (
-            <div className="table-wrap">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th aria-label="Expand" style={{ width: 32 }} />
-                    <th>Name</th>
-                    <th>Scope</th>
-                    <th>Client</th>
-                    <th>Expires</th>
-                    <th aria-label="Actions" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {tokens.map((token) => {
-                    const isOpen = expandedTokens.has(token.name);
-                    return (
-                      <Fragment key={token.name}>
-                        <tr
-                          className="row-clickable"
-                          onClick={() =>
-                            setExpandedTokens((current) => {
-                              const next = new Set(current);
-                              if (next.has(token.name)) next.delete(token.name);
-                              else next.add(token.name);
-                              return next;
-                            })
-                          }
-                        >
-                          <td className="row-chevron">
-                            <ChevronRight
-                              size={14}
-                              style={{
-                                transform: isOpen ? 'rotate(90deg)' : 'none',
-                                transition: 'transform 120ms ease',
-                              }}
-                            />
-                          </td>
-                          <td><span className="cell-strong">{token.name}</span></td>
-                          <td><code className="mono">{token.scope}</code></td>
-                          <td>{token.client ?? <span className="muted">any</span>}</td>
-                          <td>{formatExpiry(token.expiresAt)}</td>
-                          <td className="row-actions">
-                            <button
-                              className="row-action danger"
-                              title={`Revoke ${token.name}`}
-                              disabled={busy === `token-remove-${token.name}`}
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                void revokeTokenById(token.name);
-                              }}
-                            >
-                              {busy === `token-remove-${token.name}` ? (
-                                <Loader2 size={14} className="spin" />
-                              ) : (
-                                <Trash2 size={14} />
-                              )}
-                            </button>
-                          </td>
-                        </tr>
-                        {isOpen && (
-                          <tr className="row-expanded">
-                            <td colSpan={6}>
-                              <TokenEditor
-                                token={token}
-                                mounts={mounts}
-                                busy={busy}
-                                onSave={(input) => saveTokenEdit(token.name, input)}
-                                onRotate={() => rotateTokenById(token.name)}
-                                onRevoke={() => revokeTokenById(token.name)}
-                              />
-                            </td>
-                          </tr>
-                        )}
-                      </Fragment>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-
-        <SharesCard
-          shares={shares}
-          mounts={mounts}
+        <LeasesCard
+          leases={leases}
           tunnel={tunnel}
           serverReachable={reachable}
-          showForm={showShareForm}
-          onToggleForm={() => setShowShareForm((v) => !v)}
-          shareResult={shareResult}
-          onDismissResult={() => setShareResult(null)}
+          showForm={showLeaseForm}
+          onToggleForm={() => setShowLeaseForm((v) => !v)}
+          leaseResult={leaseResult}
+          onDismissResult={() => setLeaseResult(null)}
           busy={busy}
-          onCreateFromMount={createShareFromMount}
-          onBrowseAndShare={browseAndShare}
-          onRevoke={revokeShare}
+          onCreate={createLease}
+          onBrowse={browseAndCreateLease}
+          onAddPaths={addPathsToLease}
+          onRevoke={revokeLease}
           onOpen={(url) => window.mvmtDesktop.openExternal(url)}
           onCopy={copyToClipboard}
-          listMountFiles={(name) => window.mvmtDesktop.listMountFiles(name)}
         />
         </>)}
 
@@ -836,9 +591,14 @@ function EndpointsCard({
   reachable,
   port,
   busy,
+  showTunnelConfig,
   onStartServer,
   onStopServer,
   onStartTunnel,
+  onConfigureQuickTunnel,
+  onConfigureCloudflareTunnel,
+  onShowTunnelConfig,
+  onDismissTunnelConfig,
   onStopTunnel,
   onRefreshTunnel,
   onOpen,
@@ -849,9 +609,14 @@ function EndpointsCard({
   reachable: boolean;
   port: number;
   busy: string | null;
+  showTunnelConfig: boolean;
   onStartServer: () => void | Promise<void>;
   onStopServer: () => void | Promise<void>;
   onStartTunnel: () => void | Promise<void>;
+  onConfigureQuickTunnel: () => void | Promise<void>;
+  onConfigureCloudflareTunnel: (path: string) => void | Promise<void>;
+  onShowTunnelConfig: () => void | Promise<void>;
+  onDismissTunnelConfig: () => void | Promise<void>;
   onStopTunnel: () => void | Promise<void>;
   onRefreshTunnel: () => void | Promise<void>;
   onOpen: (url: string) => void | Promise<void>;
@@ -859,10 +624,13 @@ function EndpointsCard({
 }): JSX.Element {
   const serverBusy = busy === 'server';
   const tunnelBusy = busy === 'tunnel';
+  const [cloudflareConfigPath, setCloudflareConfigPath] = useState('~/.cloudflared/config.yml');
   const localEndpoint = `127.0.0.1:${port}`;
   const localUrl = `http://${localEndpoint}`;
   const publicUrl = tunnel?.publicUrl ?? null;
-  const tunnelRunning = Boolean(tunnel?.running && publicUrl);
+  const publicBaseUrl = publicUrl ? publicFileBaseUrl(publicUrl) : null;
+  const publicMcpUrl = publicBaseUrl ? `${publicBaseUrl}/mcp` : null;
+  const tunnelRunning = Boolean(tunnel?.running && publicBaseUrl);
   const tunnelConfigured = Boolean(tunnel?.configured);
 
   return (
@@ -927,21 +695,21 @@ function EndpointsCard({
         <div className="endpoint-meta">
           <div className="endpoint-label">
             <StatusDot reachable={tunnelRunning} />
-            <span>Public endpoint</span>
+            <span>Public file access</span>
             {tunnel?.command && tunnelRunning ? (
               <span className="endpoint-tag">{providerLabel(tunnel.command)}</span>
             ) : null}
           </div>
           <div className="endpoint-value">
-            {publicUrl ? (
+            {publicBaseUrl ? (
               <>
-                <code className="mono endpoint-url">{publicUrl}</code>
+                <code className="mono endpoint-url">{publicBaseUrl}</code>
                 <div className="endpoint-actions">
                   <button
                     type="button"
                     className="row-action"
                     title="Copy"
-                    onClick={() => onCopy(publicUrl, 'Public URL')}
+                    onClick={() => onCopy(publicBaseUrl, 'Public file URL')}
                   >
                     <Copy size={14} />
                   </button>
@@ -949,7 +717,7 @@ function EndpointsCard({
                     type="button"
                     className="row-action"
                     title="Open in browser"
-                    onClick={() => onOpen(publicUrl)}
+                    onClick={() => onOpen(publicBaseUrl)}
                   >
                     <ExternalLink size={14} />
                   </button>
@@ -976,6 +744,12 @@ function EndpointsCard({
                 onClick={onRefreshTunnel}
               />
               <GhostButton
+                icon={<Settings size={14} />}
+                label="Reconfigure"
+                busy={tunnelBusy}
+                onClick={onShowTunnelConfig}
+              />
+              <GhostButton
                 icon={<Square size={14} />}
                 label="Stop"
                 busy={tunnelBusy}
@@ -983,29 +757,83 @@ function EndpointsCard({
               />
             </>
           ) : (
-            <PrimaryButton
-              icon={<Globe size={13} />}
-              label="Start tunnel"
-              busy={tunnelBusy}
-              disabled={!reachable}
-              onClick={onStartTunnel}
-            />
+            <>
+              <PrimaryButton
+                icon={<Globe size={13} />}
+                label="Start tunnel"
+                busy={tunnelBusy}
+                disabled={!reachable}
+                onClick={onStartTunnel}
+              />
+              {tunnelConfigured && (
+                <GhostButton
+                  icon={<Settings size={14} />}
+                  label="Reconfigure"
+                  busy={tunnelBusy}
+                  disabled={!reachable}
+                  onClick={onShowTunnelConfig}
+                />
+              )}
+            </>
           )}
         </div>
       </div>
 
-      {!tunnelConfigured && reachable && (
+      {publicBaseUrl && (
         <div className="endpoint-hint">
-          <span>Tunnel not configured.</span>
-          <code className="mono">mvmt tunnel config</code>
+          <span>Lease links are created as</span>
+          <code className="mono">{publicBaseUrl}/lease/&lt;id&gt;</code>
+          <span className="muted">from the Leases card.</span>
+          {publicMcpUrl && (
+            <>
+              <span className="muted">MCP</span>
+              <code className="mono">{publicMcpUrl}</code>
+              <button
+                type="button"
+                className="link-button"
+                onClick={() => onCopy(publicMcpUrl, 'MCP endpoint')}
+              >
+                Copy
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
+      {showTunnelConfig && reachable && (
+        <div className="endpoint-hint">
+          <span>{tunnelConfigured ? 'Reconfigure tunnel' : 'Choose a tunnel'}</span>
           <button
             type="button"
             className="link-button"
-            onClick={() => onCopy('mvmt tunnel config', 'Command')}
+            disabled={tunnelBusy}
+            onClick={onConfigureQuickTunnel}
           >
-            Copy
+            Quick Tunnel
           </button>
-          <span className="muted">— run once in a terminal.</span>
+          <button
+            type="button"
+            className="link-button"
+            disabled={tunnelBusy}
+            onClick={() => onConfigureCloudflareTunnel(cloudflareConfigPath)}
+          >
+            Cloudflare config
+          </button>
+          <input
+            className="endpoint-path-input"
+            value={cloudflareConfigPath}
+            onChange={(event) => setCloudflareConfigPath(event.target.value)}
+            placeholder="~/.cloudflared/config.yml"
+            disabled={tunnelBusy}
+          />
+          <button
+            type="button"
+            className="link-button muted"
+            disabled={tunnelBusy}
+            onClick={onDismissTunnelConfig}
+          >
+            Cancel
+          </button>
         </div>
       )}
 
@@ -1018,6 +846,18 @@ function providerLabel(command: string): string {
   if (lower.includes('cloudflared')) return 'cloudflared';
   if (lower.includes('lhr.life') || lower.includes('localhost.run')) return 'localhost.run';
   return command.split(/\s+/)[0] ?? 'tunnel';
+}
+
+function publicFileBaseUrl(value: string): string {
+  try {
+    const parsed = new URL(value);
+    parsed.hash = '';
+    parsed.search = '';
+    if (parsed.pathname === '/mcp' || parsed.pathname === '/') parsed.pathname = '';
+    return parsed.toString().replace(/\/+$/, '');
+  } catch {
+    return value.replace(/\/mcp\/?$/, '').replace(/\/+$/, '');
+  }
 }
 
 function StatusDot({ reachable }: { reachable: boolean }): JSX.Element {
@@ -1672,6 +1512,358 @@ function TokenEditor({
         </button>
       </div>
     </div>
+  );
+}
+
+function leaseUnavailableReason(lease: LeaseSummary): 'expired' | 'revoked' | null {
+  if (lease.revokedAt) return 'revoked';
+  if (lease.expiresAt) {
+    const t = new Date(lease.expiresAt).getTime();
+    if (!Number.isNaN(t) && t < Date.now()) return 'expired';
+  }
+  return null;
+}
+
+function leaseModeLabel(lease: LeaseSummary): string {
+  return lease.permissions.includes('upload') ? 'upload only' : 'browse/download';
+}
+
+function leaseActivity(lease: LeaseSummary): string {
+  return lease.permissions.includes('upload')
+    ? `${lease.uploadCount} uploads`
+    : `${lease.downloadCount} downloads`;
+}
+
+function formatLeasePaths(lease: LeaseSummary): string {
+  const paths = lease.resources?.length ? lease.resources.map((resource) => resource.path) : [lease.path];
+  return paths.join(', ');
+}
+
+function parseLeasePaths(value: string): string[] {
+  return value
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function LeasesCard({
+  leases,
+  tunnel,
+  serverReachable,
+  showForm,
+  onToggleForm,
+  leaseResult,
+  onDismissResult,
+  busy,
+  onCreate,
+  onBrowse,
+  onAddPaths,
+  onRevoke,
+  onOpen,
+  onCopy,
+}: {
+  leases: LeaseSummary[];
+  tunnel: TunnelStatus | null;
+  serverReachable: boolean;
+  showForm: boolean;
+  onToggleForm: () => void;
+  leaseResult: { url: string; path: string; label: string; mode: string; expiresAt: string | null } | null;
+  onDismissResult: () => void;
+  busy: string | null;
+  onCreate: (input: { paths: string[]; label: string; mode: 'read' | 'upload'; expires: string }) => void | Promise<void>;
+  onBrowse: (input: { label: string; mode: 'read' | 'upload'; expires: string }) => void | Promise<void>;
+  onAddPaths: (id: string, label: string) => void | Promise<void>;
+  onRevoke: (id: string, label: string) => void | Promise<void>;
+  onOpen: (url: string) => void | Promise<void>;
+  onCopy: (text: string, label: string) => void | Promise<void>;
+}): JSX.Element {
+  const tunnelLive = Boolean(tunnel?.running && tunnel?.publicUrl);
+  const [leaseView, setLeaseView] = useState<'active' | 'history'>('active');
+  const activeLeases = useMemo(
+    () => leases.filter((lease) => leaseUnavailableReason(lease) === null),
+    [leases],
+  );
+  const inactiveLeases = useMemo(
+    () => leases.filter((lease) => leaseUnavailableReason(lease) !== null),
+    [leases],
+  );
+  const visibleLeases = leaseView === 'active' ? activeLeases : inactiveLeases;
+
+  return (
+    <section className="card">
+      <div className="card-header">
+        <div>
+          <h2 className="card-title">Leases</h2>
+          <p className="card-sub">
+            Create expiring links for files and folders.{' '}
+            {!tunnelLive && (
+              <span className="muted">Tunnel offline - links work locally only.</span>
+            )}
+          </p>
+        </div>
+        <div className="card-actions">
+          <div className="segmented">
+            <button
+              type="button"
+              className={leaseView === 'active' ? 'on' : ''}
+              onClick={() => setLeaseView('active')}
+            >
+              Active {activeLeases.length}
+            </button>
+            <button
+              type="button"
+              className={leaseView === 'history' ? 'on' : ''}
+              onClick={() => setLeaseView('history')}
+            >
+              History {inactiveLeases.length}
+            </button>
+          </div>
+          <PrimaryButton
+            variant={showForm ? 'ghost' : 'solid'}
+            icon={showForm ? <X size={13} /> : <Plus size={13} />}
+            label={showForm ? 'Cancel' : 'Create lease'}
+            onClick={onToggleForm}
+          />
+        </div>
+      </div>
+
+      {showForm && (
+        <LeaseForm
+          busy={busy}
+          onSubmit={onCreate}
+          onBrowse={onBrowse}
+        />
+      )}
+
+      {leaseResult && (
+        <div className="share-result">
+          <div className="share-result-head">
+            <div>
+              <div className="share-result-title">
+                <Check size={14} aria-hidden /> Lease link ready
+              </div>
+              <div className="share-result-warn">
+                Copy the link now - the token won't appear again.
+              </div>
+            </div>
+            <button type="button" className="link-button" onClick={onDismissResult}>
+              Dismiss
+            </button>
+          </div>
+          <dl className="token-result-meta">
+            <Detail label="Label" value={leaseResult.label} />
+            <Detail label="Mode" value={leaseResult.mode} />
+            <Detail label="Path" value={leaseResult.path} mono />
+            <Detail label="Expires" value={leaseResult.expiresAt ? formatTimestamp(leaseResult.expiresAt) : 'never'} />
+          </dl>
+          <div className="token-secret">
+            <span className="token-secret-label">URL</span>
+            <code className="token-secret-value mono">{leaseResult.url}</code>
+            <button
+              type="button"
+              className="row-action"
+              title="Copy URL"
+              onClick={() => onCopy(leaseResult.url, 'Lease URL')}
+            >
+              <Copy size={14} />
+            </button>
+            <button
+              type="button"
+              className="row-action"
+              title="Open in browser"
+              onClick={() => onOpen(leaseResult.url)}
+            >
+              <ExternalLink size={14} />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {visibleLeases.length === 0 ? (
+        <EmptyState
+          icon={<LinkIcon size={20} />}
+          title={leaseView === 'active' ? 'No active leases' : 'No revoked or expired leases'}
+          hint={
+            leaseView === 'active'
+              ? 'Create a lease to share local files or folders.'
+              : 'Revoked and expired leases will appear here.'
+          }
+        />
+      ) : (
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Label</th>
+                <th>Path</th>
+                <th>Mode</th>
+                <th>Status</th>
+                <th>Expires</th>
+                <th>Activity</th>
+                <th aria-label="Actions" />
+              </tr>
+            </thead>
+            <tbody>
+              {visibleLeases.map((lease) => {
+                const reason = leaseUnavailableReason(lease);
+                const removing = busy === `lease-revoke-${lease.id}`;
+                const addingPaths = busy === `lease-add-paths-${lease.id}`;
+                const canAddPaths = !reason && !lease.permissions.includes('upload');
+                return (
+                  <tr key={lease.id}>
+                    <td>
+                      <div className="cell-stack">
+                        <span className="cell-strong">{lease.label}</span>
+                        <span className="muted share-id">id {lease.id}</span>
+                      </div>
+                    </td>
+                    <td><code className="mono">{formatLeasePaths(lease)}</code></td>
+                    <td>{leaseModeLabel(lease)}</td>
+                    <td>
+                      {reason ? (
+                        <span className="muted-tag">{reason}</span>
+                      ) : (
+                        <span className="access-badge read">active</span>
+                      )}
+                    </td>
+                    <td>{lease.expiresAt ? formatTimestamp(lease.expiresAt) : 'never'}</td>
+                    <td>{leaseActivity(lease)}</td>
+                    <td className="row-actions share-row-actions">
+                      {canAddPaths && (
+                        <button
+                          type="button"
+                          className="row-action"
+                          title={`Add paths to ${lease.label}`}
+                          disabled={addingPaths}
+                          onClick={() => onAddPaths(lease.id, lease.label)}
+                        >
+                          {addingPaths ? <Loader2 size={14} className="spin" /> : <Plus size={14} />}
+                        </button>
+                      )}
+                      {lease.url ? (
+                        <>
+                          <button
+                            type="button"
+                            className="row-action"
+                            title="Copy URL"
+                            onClick={() => onCopy(lease.url!, 'Lease URL')}
+                          >
+                            <Copy size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            className="row-action"
+                            title="Open in browser"
+                            onClick={() => onOpen(lease.url!)}
+                          >
+                            <ExternalLink size={14} />
+                          </button>
+                        </>
+                      ) : (
+                        <span
+                          className="muted share-no-url"
+                          title="URL was created elsewhere - revoke and recreate to get a new link."
+                        >
+                          -
+                        </span>
+                      )}
+                      <button
+                        className="row-action danger"
+                        title={`Revoke ${lease.label}`}
+                        disabled={removing}
+                        onClick={() => onRevoke(lease.id, lease.label)}
+                      >
+                        {removing ? (
+                          <Loader2 size={14} className="spin" />
+                        ) : (
+                          <Trash2 size={14} />
+                        )}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function LeaseForm({
+  busy,
+  onSubmit,
+  onBrowse,
+}: {
+  busy: string | null;
+  onSubmit: (input: { paths: string[]; label: string; mode: 'read' | 'upload'; expires: string }) => void | Promise<void>;
+  onBrowse: (input: { label: string; mode: 'read' | 'upload'; expires: string }) => void | Promise<void>;
+}): JSX.Element {
+  const [pathsText, setPathsText] = useState('');
+  const [label, setLabel] = useState('');
+  const [mode, setMode] = useState<'read' | 'upload'>('read');
+  const [expires, setExpires] = useState('24h');
+  const createBusy = busy === 'lease-create';
+  const browseBusy = busy === 'lease-browse';
+
+  const submit = (event: FormEvent<HTMLFormElement>): void => {
+    event.preventDefault();
+    const paths = parseLeasePaths(pathsText);
+    if (paths.length === 0 || !label.trim()) return;
+    void onSubmit({ paths, label: label.trim(), mode, expires });
+  };
+
+  return (
+    <form onSubmit={submit} className="inline-form share-form">
+      <div className="field-grid">
+        <Field label="Label" required>
+          <input
+            value={label}
+            onChange={(event) => setLabel(event.target.value)}
+            placeholder="Sarah - tax docs"
+            required
+          />
+        </Field>
+        <Field label="Mode" required>
+          <div className="scope-select">
+            <select value={mode} onChange={(event) => setMode(event.target.value as 'read' | 'upload')}>
+              <option value="read">Browse/download</option>
+              <option value="upload">Upload only</option>
+            </select>
+          </div>
+        </Field>
+        <Field label={mode === 'upload' ? 'Folder' : 'Paths'} full required>
+          <div className="input-with-action">
+            <textarea
+              value={pathsText}
+              onChange={(event) => setPathsText(event.target.value)}
+              placeholder={mode === 'upload' ? '/Users/you/Uploads' : '/Users/you/Documents/report.pdf\n/Users/you/Documents/Taxes'}
+              required
+            />
+            <button
+              type="button"
+              className="input-action"
+              disabled={!label.trim() || browseBusy}
+              onClick={() => onBrowse({ label: label.trim(), mode, expires })}
+            >
+              {browseBusy ? <Loader2 size={14} className="spin" /> : <FolderOpen size={14} />}
+              Browse
+            </button>
+          </div>
+        </Field>
+      </div>
+      <ExpirySelector value={expires} onChange={setExpires} />
+      <div className="form-actions">
+        <PrimaryButton
+          type="submit"
+          icon={<LinkIcon size={13} />}
+          label="Create lease"
+          busy={createBusy}
+          disabled={parseLeasePaths(pathsText).length === 0 || !label.trim()}
+        />
+      </div>
+    </form>
   );
 }
 

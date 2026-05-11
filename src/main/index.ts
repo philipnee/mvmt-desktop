@@ -11,15 +11,20 @@ import {
   sep,
 } from 'node:path';
 import {
+  type AddLeasePathsInput,
   type AddMountInput,
+  type BrowseLeaseInput,
   type BrowseShareInput,
   type BrowseShareResult,
   type CommandResult,
+  type CreatedLease,
   type CreatedShare,
+  type CreateLeaseInput,
   type CreateShareInput,
   type CreateTokenInput,
   type EditTokenInput,
   type MountFileEntry,
+  type LeaseSummary,
   type ShareSummary,
   type MountSummary,
   type ServerStatus,
@@ -34,11 +39,16 @@ function resolveResourcesRoot(): string {
 function resolveMvmtBin(): string {
   if (process.env.MVMT_BIN) return process.env.MVMT_BIN;
   // Packaged: <resourcesPath>/mvmt/dist/bin/mvmt.js
-  // Dev: <repo>/vendor/mvmt/dist/bin/mvmt.js, falling back to ~/code/mvmt for local dev
-  const candidates = [
+  // Dev: prefer the live sibling engine, then fall back to the vendored copy.
+  const devCandidates = [
+    '/Users/philipnee/code/mvmt/dist/bin/mvmt.js',
+    join(resolveResourcesRoot(), 'mvmt', 'dist', 'bin', 'mvmt.js'),
+  ];
+  const packagedCandidates = [
     join(resolveResourcesRoot(), 'mvmt', 'dist', 'bin', 'mvmt.js'),
     '/Users/philipnee/code/mvmt/dist/bin/mvmt.js',
   ];
+  const candidates = app.isPackaged ? packagedCandidates : devCandidates;
   return candidates.find(existsSync) ?? candidates[0];
 }
 
@@ -85,9 +95,14 @@ const COMMAND_TIMEOUT_MS = 30_000;
 const LOG_BUFFER_MAX = 800;
 
 let shareUrlCache: Record<string, string> = {};
+let leaseUrlCache: Record<string, string> = {};
 
 function shareCachePath(): string {
   return join(app.getPath('userData'), 'share-urls.json');
+}
+
+function leaseCachePath(): string {
+  return join(app.getPath('userData'), 'lease-urls.json');
 }
 
 function loadShareUrlCache(): void {
@@ -114,10 +129,47 @@ function persistShareUrlCache(): void {
   }
 }
 
+function loadLeaseUrlCache(): void {
+  try {
+    const raw = readFileSync(leaseCachePath(), 'utf8');
+    const parsed = JSON.parse(raw) as Record<string, string>;
+    if (parsed && typeof parsed === 'object') {
+      leaseUrlCache = Object.fromEntries(
+        Object.entries(parsed).filter(([, value]) => typeof value === 'string'),
+      );
+    }
+  } catch {
+    /* no cache yet */
+  }
+}
+
+function persistLeaseUrlCache(): void {
+  const file = leaseCachePath();
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify(leaseUrlCache, null, 2), { mode: 0o600 });
+  } catch (error) {
+    appendServerLog(`Could not persist lease URL cache: ${(error as Error).message}\n`);
+  }
+}
+
 function rememberShareUrl(id: string, url: string): void {
   if (!id || !url) return;
   shareUrlCache[id] = url;
   persistShareUrlCache();
+}
+
+function rememberLeaseUrl(id: string, url: string): void {
+  if (!id || !url) return;
+  leaseUrlCache[id] = url;
+  persistLeaseUrlCache();
+}
+
+function forgetLeaseUrl(id: string): void {
+  if (id in leaseUrlCache) {
+    delete leaseUrlCache[id];
+    persistLeaseUrlCache();
+  }
 }
 
 function forgetShareUrl(id: string): void {
@@ -156,6 +208,7 @@ function createWindow(): void {
 
 app.whenReady().then(() => {
   loadShareUrlCache();
+  loadLeaseUrlCache();
   registerIpcHandlers();
   createWindow();
   void autoStartOnLaunch();
@@ -188,6 +241,12 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle('mvmt:tokens:rotate', (_event, id: string) => rotateToken(id));
   ipcMain.handle('mvmt:tokens:remove', (_event, id: string) => removeToken(id));
+  ipcMain.handle('mvmt:leases:list', () => listLeases());
+  ipcMain.handle('mvmt:leases:create', (_event, input: CreateLeaseInput) => createLease(input));
+  ipcMain.handle('mvmt:leases:add-paths', (_event, input: AddLeasePathsInput) => addLeasePaths(input));
+  ipcMain.handle('mvmt:leases:revoke', (_event, id: string) => revokeLease(id));
+  ipcMain.handle('mvmt:leases:browse', (_event, input: BrowseLeaseInput) => browseAndCreateLease(input));
+  ipcMain.handle('mvmt:leases:browse-add-paths', (_event, id: string) => browseAndAddLeasePaths(id));
   ipcMain.handle('mvmt:shares:list', () => listShares());
   ipcMain.handle('mvmt:shares:add', (_event, input: CreateShareInput) => addShare(input));
   ipcMain.handle('mvmt:shares:remove', (_event, id: string) => removeShare(id));
@@ -196,6 +255,8 @@ function registerIpcHandlers(): void {
   ipcMain.handle('mvmt:reindex', () => runMvmt(['reindex']));
   ipcMain.handle('mvmt:open-local-server', () => shell.openExternal(METADATA_URL));
   ipcMain.handle('mvmt:tunnel:status', () => runTunnelCommand([]));
+  ipcMain.handle('mvmt:tunnel:configure-quick', () => configureQuickTunnel());
+  ipcMain.handle('mvmt:tunnel:configure-cloudflare-config', (_event, path: string) => configureCloudflareTunnel(path));
   ipcMain.handle('mvmt:tunnel:start', () => runTunnelCommand(['start']));
   ipcMain.handle('mvmt:tunnel:stop', () => runTunnelCommand(['stop']));
   ipcMain.handle('mvmt:tunnel:refresh', () => runTunnelCommand(['refresh']));
@@ -237,6 +298,17 @@ async function runTunnelCommand(verb: string[]): Promise<TunnelStatus> {
     }
     throw error;
   }
+}
+
+async function configureQuickTunnel(): Promise<TunnelStatus> {
+  const result = await runMvmt(['tunnel', 'config', '--quick']);
+  return parseTunnelOutput(result.stdout, result.stderr, ['config']);
+}
+
+async function configureCloudflareTunnel(configPath: string): Promise<TunnelStatus> {
+  const selectedPath = requireValue(configPath, 'Cloudflare config path');
+  const result = await runMvmt(['tunnel', 'config', '--cloudflare-config', selectedPath]);
+  return parseTunnelOutput(result.stdout, result.stderr, ['config']);
 }
 
 function parseTunnelOutput(stdout: string, stderr: string, verb: string[]): TunnelStatus {
@@ -402,6 +474,131 @@ function rotateToken(id: string): Promise<CommandResult> {
 
 function removeToken(id: string): Promise<CommandResult> {
   return runMvmt(['token', 'remove', requireValue(id, 'Token id'), '--yes']);
+}
+
+async function listLeases(): Promise<LeaseSummary[]> {
+  try {
+    const result = await runMvmt(['lease', '--json']);
+    const parsed = parseJson<{ leases: RawLease[] }>(result.stdout, 'lease list');
+    const leases = parsed.leases.map(toLeaseSummary);
+    const liveIds = new Set(leases.map((lease) => lease.id));
+    let pruned = false;
+    for (const id of Object.keys(leaseUrlCache)) {
+      if (!liveIds.has(id)) {
+        delete leaseUrlCache[id];
+        pruned = true;
+      }
+    }
+    if (pruned) persistLeaseUrlCache();
+    return leases;
+  } catch (error) {
+    if (isMissingConfigError(error)) return [];
+    throw error;
+  }
+}
+
+async function createLease(input: CreateLeaseInput): Promise<CreatedLease> {
+  const leasePaths = (input.paths?.length ? input.paths : input.path ? [input.path] : [])
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (leasePaths.length === 0) throw new Error('Lease path is required.');
+  const label = requireValue(input.label, 'Lease label');
+  const mode = input.mode === 'upload' ? 'upload' : 'read';
+  const args = ['lease', 'create', ...leasePaths, '--label', label, '--mode', mode];
+  if (input.expires?.trim()) args.push('--expires', input.expires.trim());
+  const result = await runMvmt(args);
+  const created = parseLeaseCreateOutput(result.stdout, { paths: leasePaths, label, mode });
+  rememberLeaseUrl(created.lease.id, created.url);
+  return created;
+}
+
+function parseLeaseCreateOutput(
+  stdout: string,
+  fallback: { paths: string[]; label: string; mode: 'read' | 'upload' },
+): CreatedLease {
+  const field = (key: string): string | null => {
+    const match = stdout.match(new RegExp(`^\\s*${key}:\\s*(.+?)\\s*$`, 'm'));
+    return match ? match[1].trim() : null;
+  };
+  const url = field('URL');
+  if (!url) {
+    throw new Error(`Could not parse lease URL from mvmt output:\n${stdout.trim()}`);
+  }
+  const expiresLine = field('Expires');
+  const expiresAt = expiresLine
+    ? expiresLine.replace(/\s*\(.*\)\s*$/, '').trim()
+    : null;
+  let id = '';
+  try {
+    const parsed = new URL(url);
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    if (segments[0] === 'lease' && segments[1]) id = segments[1];
+  } catch {
+    /* ignore */
+  }
+  const modeLine = field('Mode') ?? fallback.mode;
+  const permissions = /upload/i.test(modeLine) ? ['upload'] : ['read'];
+  const pathsLine = field('Paths') ?? field('Path') ?? field('Folder');
+  const paths = pathsLine
+    ? pathsLine.split(',').map((value) => value.trim()).filter(Boolean)
+    : fallback.paths;
+  const path = paths.join(', ');
+  return {
+    lease: {
+      id,
+      label: field('Label') ?? fallback.label,
+      path,
+      resources: paths.map((resourcePath) => ({ path: resourcePath, sourcePath: resourcePath, type: 'folder' as const })),
+      permissions,
+      createdAt: new Date().toISOString(),
+      expiresAt: expiresAt && expiresAt !== 'never' ? expiresAt : null,
+      lastUsedAt: null,
+      revokedAt: null,
+      downloadCount: 0,
+      uploadCount: 0,
+      url,
+    },
+    url,
+  };
+}
+
+async function revokeLease(id: string): Promise<CommandResult> {
+  const leaseId = requireValue(id, 'Lease id');
+  const result = await runMvmt(['lease', 'revoke', leaseId]);
+  forgetLeaseUrl(leaseId);
+  return result;
+}
+
+async function addLeasePaths(input: AddLeasePathsInput): Promise<CommandResult> {
+  const leaseId = requireValue(input.id, 'Lease id');
+  const paths = input.paths.map((value) => value.trim()).filter(Boolean);
+  if (paths.length === 0) throw new Error('Lease path is required.');
+  return runMvmt(['lease', 'add-path', leaseId, ...paths]);
+}
+
+async function browseAndCreateLease(input: BrowseLeaseInput): Promise<CreatedLease | null> {
+  const mode = input.mode === 'upload' ? 'upload' : 'read';
+  const result = await dialog.showOpenDialog(mainWindow ?? undefined, {
+    properties: mode === 'upload' ? ['openDirectory', 'createDirectory'] : ['openFile', 'openDirectory', 'multiSelections'],
+    title: mode === 'upload' ? 'Pick a folder to receive uploads' : 'Pick files or folders to lease',
+  });
+  if (result.canceled || !result.filePaths[0]) return null;
+  return createLease({
+    paths: mode === 'upload' ? [result.filePaths[0]] : result.filePaths,
+    label: input.label,
+    mode,
+    expires: input.expires,
+  });
+}
+
+async function browseAndAddLeasePaths(id: string): Promise<CommandResult | null> {
+  const leaseId = requireValue(id, 'Lease id');
+  const result = await dialog.showOpenDialog(mainWindow ?? undefined, {
+    properties: ['openFile', 'openDirectory', 'multiSelections'],
+    title: 'Pick files or folders to add to this lease',
+  });
+  if (result.canceled || !result.filePaths[0]) return null;
+  return addLeasePaths({ id: leaseId, paths: result.filePaths });
 }
 
 async function listShares(): Promise<ShareSummary[]> {
@@ -620,6 +817,43 @@ function makeMountSlug(filename: string): string {
   const safe = stem.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'file';
   const suffix = Math.random().toString(36).slice(2, 6);
   return `share-${safe}-${suffix}`;
+}
+
+interface RawLease {
+  id: string;
+  label: string;
+  path: string;
+  resources?: { path: string; sourcePath?: string; type?: string }[];
+  permissions?: string[];
+  createdAt: string;
+  expiresAt?: string | null;
+  lastUsedAt?: string | null;
+  revokedAt?: string | null;
+  downloadCount?: number;
+  uploadCount?: number;
+}
+
+function toLeaseSummary(raw: RawLease): LeaseSummary {
+  const resources = (raw.resources?.length ? raw.resources : [{ path: raw.path, sourcePath: raw.path, type: 'folder' }])
+    .map((resource) => ({
+      path: resource.path,
+      sourcePath: resource.sourcePath ?? resource.path,
+      type: resource.type === 'file' ? 'file' as const : 'folder' as const,
+    }));
+  return {
+    id: raw.id,
+    label: raw.label,
+    path: resources.map((resource) => resource.path).join(', '),
+    resources,
+    permissions: raw.permissions ?? ['read'],
+    createdAt: raw.createdAt,
+    expiresAt: raw.expiresAt ?? null,
+    lastUsedAt: raw.lastUsedAt ?? null,
+    revokedAt: raw.revokedAt ?? null,
+    downloadCount: raw.downloadCount ?? 0,
+    uploadCount: raw.uploadCount ?? 0,
+    url: leaseUrlCache[raw.id] ?? null,
+  };
 }
 
 interface RawShare {
